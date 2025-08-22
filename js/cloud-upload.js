@@ -567,4 +567,143 @@ jQuery(document).ready(function($) {
         };
     }
 
+    // 删除本地文件按钮点击事件
+    $('#dmy-delete-local-files').on('click', function() {
+        var $button = $(this);
+        var $progress = $('#dmy-delete-progress');
+        var $progressBar = $progress.find('.progress-fill');
+        var $progressText = $progress.find('.progress-text');
+
+        // 确认对话框
+        if (!confirm('⚠️ 警告：此操作将删除已上传到云盘的文件的本地副本！\n\n删除后无法恢复，请确保：\n• 云盘服务稳定可靠\n• 已备份重要文件\n• 了解删除风险\n\n确定要继续吗？')) {
+            return;
+        }
+
+        // 二次确认
+        if (!confirm('最后确认：您真的要删除本地文件吗？\n\n此操作不可撤销！')) {
+            return;
+        }
+
+        // 禁用按钮并显示进度条
+        $button.prop('disabled', true).text('正在删除...');
+        $progress.show();
+        $progressBar.css('width', '0%');
+        $progressText.text('准备删除本地文件...');
+
+        // 开始批量删除
+        batchDeleteLocalFiles(1, 0);
+    });
+
+    // 暂停删除按钮
+    $('#dmy-pause-delete').on('click', function() {
+        window.dmyDeletePaused = true;
+        $(this).prop('disabled', true).text('已暂停');
+        $('#dmy-cancel-delete').text('继续删除').prop('disabled', false);
+    });
+
+    // 取消/继续删除按钮
+    $('#dmy-cancel-delete').on('click', function() {
+        var $button = $(this);
+        if ($button.text() === '继续删除') {
+            window.dmyDeletePaused = false;
+            $button.text('取消删除');
+            $('#dmy-pause-delete').prop('disabled', false).text('暂停删除');
+        } else {
+            // 取消删除
+            window.dmyDeleteCancelled = true;
+            $('#dmy-delete-local-files').prop('disabled', false).text('🗑️ 批量删除本地文件');
+            $('#dmy-delete-progress').hide();
+        }
+    });
+
+    // 批量删除本地文件函数
+    function batchDeleteLocalFiles(page, processed) {
+        // 检查是否被取消
+        if (window.dmyDeleteCancelled) {
+            return;
+        }
+
+        // 检查是否被暂停
+        if (window.dmyDeletePaused) {
+            setTimeout(function() {
+                batchDeleteLocalFiles(page, processed);
+            }, 1000);
+            return;
+        }
+
+        $.ajax({
+            url: dmy_cloud_ajax.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'dmy_delete_local_files',
+                nonce: dmy_cloud_ajax.nonce,
+                page: page
+            },
+            success: function(response) {
+                if (response.success) {
+                    var data = response.data;
+                    var newProcessed = processed + data.results.length;
+
+                    // 更新进度条
+                    var progressPercent = data.has_more ? Math.round((newProcessed / (newProcessed + 50)) * 100) : 100;
+                    $('#dmy-delete-progress .progress-fill').css('width', progressPercent + '%');
+
+                    // 更新进度文本
+                    var statusText = '已删除 ' + newProcessed + ' 个文件的本地副本';
+                    if (data.has_more) {
+                        statusText += '，继续处理中...';
+                    } else {
+                        statusText += '，删除完成！';
+                    }
+                    $('#dmy-delete-progress .progress-text').text(statusText);
+
+                    // 显示详细结果
+                    var resultDetails = [];
+                    data.results.forEach(function(result) {
+                        if (result.status === 'success') {
+                            resultDetails.push('✅ ' + result.title + ' - 本地文件已删除');
+                        } else if (result.status === 'failed') {
+                            resultDetails.push('❌ ' + result.title + ' - ' + result.message);
+                        } else {
+                            resultDetails.push('⏭️ ' + result.title + ' - ' + result.message);
+                        }
+                    });
+
+                    if (resultDetails.length > 0) {
+                        console.log('删除本地文件结果:\n' + resultDetails.join('\n'));
+                    }
+
+                    // 如果还有更多文件，继续处理
+                    if (data.has_more && !window.dmyDeleteCancelled) {
+                        setTimeout(function() {
+                            batchDeleteLocalFiles(page + 1, newProcessed);
+                        }, 500); // 短暂延迟，避免服务器压力
+                    } else {
+                        // 完成处理
+                        $('#dmy-delete-local-files').prop('disabled', false).text('🗑️ 批量删除本地文件');
+                        $('#dmy-delete-progress').hide();
+
+                        if (!window.dmyDeleteCancelled) {
+                            alert('✅ 本地文件删除完成！\n\n已删除 ' + newProcessed + ' 个文件的本地副本。\n详细信息请查看浏览器控制台。');
+                        }
+
+                        // 重置状态
+                        window.dmyDeletePaused = false;
+                        window.dmyDeleteCancelled = false;
+                    }
+                } else {
+                    alert('删除失败: ' + (response.data || '未知错误'));
+                    $('#dmy-delete-local-files').prop('disabled', false).text('🗑️ 批量删除本地文件');
+                    $('#dmy-delete-progress').hide();
+                }
+            },
+            error: function(xhr, status, error) {
+                console.error('删除本地文件AJAX错误:', error);
+                alert('网络错误，请重试: ' + error);
+                $('#dmy-delete-local-files').prop('disabled', false).text('🗑️ 批量删除本地文件');
+                $('#dmy-delete-progress').hide();
+            }
+        });
+    }
+
 });

@@ -3,7 +3,7 @@
  * 零九CDN云盘上传 - 管理设置页面
  *
  * @package 零九CDN云盘上传
- * @version 2.0.0
+ * @version 1.2.0
  */
 
 // 防止直接访问
@@ -200,7 +200,43 @@ class ZeroNine_CDN_Cloud_Admin {
                                 支持断点续传，即使页面关闭也可以继续未完成的任务。处理过程中建议不要进行其他文件操作。
                             </p>
                         </div>
-                        
+
+                        <!-- 删除本地文件功能 -->
+                        <div class="dmy-cloud-section" style="margin-top: 20px;">
+                            <h3>🗑️ 删除本地文件</h3>
+                            <p>对于已上传到云盘的文件，可以删除本地副本以节省服务器空间。</p>
+
+                            <div style="background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 4px; padding: 10px; margin: 10px 0;">
+                                <strong>⚠️ 重要警告：</strong><br>
+                                • 删除本地文件后无法恢复<br>
+                                • 请确保云盘服务稳定可靠<br>
+                                • 建议先备份重要文件<br>
+                                • 删除操作不可撤销
+                            </div>
+
+                            <button type="button" id="dmy-delete-local-files" class="button button-secondary">
+                                🗑️ 批量删除本地文件
+                            </button>
+
+                            <div id="dmy-delete-progress" style="display: none; margin-top: 15px;">
+                                <div class="progress-bar-container">
+                                    <div class="progress-bar">
+                                        <div class="progress-fill"></div>
+                                    </div>
+                                </div>
+                                <div class="progress-text" style="margin-top: 5px; font-size: 12px;"></div>
+                                <div class="progress-actions" style="margin-top: 10px;">
+                                    <button type="button" id="dmy-pause-delete" class="button button-secondary button-small">暂停删除</button>
+                                    <button type="button" id="dmy-cancel-delete" class="button button-secondary button-small" style="margin-left: 5px;">取消删除</button>
+                                </div>
+                            </div>
+
+                            <p class="description" style="margin-top: 10px;">
+                                <strong>说明：</strong>此功能只会删除已成功上传到云盘的文件的本地副本。<br/>
+                                对于图片文件，会删除所有尺寸版本（缩略图、中等尺寸等）。
+                            </p>
+                        </div>
+
                         <?php submit_button(); ?>
                     </form>
                 </div>
@@ -233,7 +269,8 @@ class ZeroNine_CDN_Cloud_Admin {
                             </div>
                             <div class="file-type-category">
                                 <h4>⚙️ 可执行文件</h4>
-                                <p>EXE, MSI, DMG, APK, DEB, RPM</p>
+                                <p>EXE, MSI, DMG, <strong>APK</strong>, DEB, RPM</p>
+                                <small style="color: #e74c3c;">⚠️ 请确保文件来源可信</small>
                             </div>
                             <div class="file-type-category">
                                 <h4>🎵 音频文件</h4>
@@ -262,8 +299,37 @@ class ZeroNine_CDN_Cloud_Admin {
                         <p>
                             <strong>作者:</strong> 零九CDN<br/>
                             <strong>网站:</strong> <a href="https://www.09cdn.com" target="_blank">www.09cdn.com</a><br/>
-                            <strong>版本:</strong> 2.0.0
+                            <strong>版本:</strong> <?php echo defined('DMY_CLOUD_VERSION') ? DMY_CLOUD_VERSION : '1.2.0'; ?><br/>
+                            <strong>PHP版本:</strong>
+                            <span style="color: <?php echo version_compare(PHP_VERSION, '8.0', '>=') ? '#00a32a' : (version_compare(PHP_VERSION, '7.0', '>=') ? '#dba617' : '#d63638'); ?>">
+                                PHP <?php echo PHP_VERSION; ?>
+                                <?php if (version_compare(PHP_VERSION, '8.0', '>=')): ?>
+                                    ✅ 推荐
+                                <?php elseif (version_compare(PHP_VERSION, '7.0', '>=')): ?>
+                                    ⚠️ 兼容
+                                <?php else: ?>
+                                    ❌ 不支持
+                                <?php endif; ?>
+                            </span>
                         </p>
+
+                        <div style="margin-top: 15px; padding: 10px; background: #e8f4fd; border-radius: 4px;">
+                            <h4 style="margin: 0 0 8px 0; color: #0073aa;">🔧 v1.2.0 重要修复</h4>
+                            <ul style="margin: 0; padding-left: 20px; font-size: 12px;">
+                                <li><strong>✅ 修复重复上传</strong>：解决图片生成两张的问题</li>
+                                <li><strong>🗑️ 本地文件管理</strong>：修复"不保存副本"功能</li>
+                                <li><strong>🔧 修复工具</strong>：专用问题检查和修复工具</li>
+                                <li><strong>📊 状态管理</strong>：完整的文件状态检查统计</li>
+                                <li><strong>🎨 用户体验</strong>：改进设置说明和操作反馈</li>
+                            </ul>
+                            <p style="margin: 8px 0 0 0; font-size: 11px; color: #666;">
+                                <a href="<?php echo plugin_dir_url(__FILE__) . '../CHANGELOG.md'; ?>" target="_blank">查看完整更新日志</a> |
+                                <a href="<?php echo plugin_dir_url(__FILE__) . '../test-all-file-types.php?test=1'; ?>" target="_blank">测试文件类型支持</a> |
+                                <a href="<?php echo plugin_dir_url(__FILE__) . '../php-compatibility-check.php?check=1'; ?>" target="_blank">PHP兼容性检查</a> |
+                                <a href="<?php echo plugin_dir_url(__FILE__) . '../fix-duplicate-uploads.php?fix=1'; ?>" target="_blank" style="color: #d63638;">修复重复上传</a> |
+                                <a href="<?php echo plugin_dir_url(__FILE__) . '../local-files-status.php?check=1'; ?>" target="_blank" style="color: #0073aa;">本地文件状态</a>
+                            </p>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -279,8 +345,8 @@ class ZeroNine_CDN_Cloud_Admin {
             return;
         }
         
-        wp_enqueue_script('dmy-cloud-admin', plugin_dir_url(dirname(__FILE__)) . 'js/cloud-upload.js', array('jquery'), '2.0.0', true);
-        wp_enqueue_style('dmy-cloud-admin', plugin_dir_url(dirname(__FILE__)) . 'css/cloud-upload.css', array(), '2.0.0');
+        wp_enqueue_script('dmy-cloud-admin', plugin_dir_url(dirname(__FILE__)) . 'js/cloud-upload.js', array('jquery'), '1.2.0', true);
+        wp_enqueue_style('dmy-cloud-admin', plugin_dir_url(dirname(__FILE__)) . 'css/cloud-upload.css', array(), '1.2.0');
         
         wp_localize_script('dmy-cloud-admin', 'dmy_cloud_ajax', array(
             'ajax_url' => admin_url('admin-ajax.php'),
@@ -331,7 +397,19 @@ class ZeroNine_CDN_Cloud_Admin {
         $settings = get_option('dmy_cloud_settings', array());
         $checked = !empty($settings['dmy_cloud_keep_local']) ? 'checked' : '';
         echo "<input type='checkbox' name='dmy_cloud_settings[dmy_cloud_keep_local]' value='1' $checked />";
-        echo "<p class='description'>开启后，上传到云盘的同时保留本地文件副本。</p>";
+        echo "<p class='description'>";
+        echo "<strong>开启</strong>：上传到云盘后保留本地文件副本（推荐，确保数据安全）<br>";
+        echo "<strong>关闭</strong>：上传到云盘后删除本地文件，节省服务器空间（需确保云盘稳定可靠）";
+        echo "</p>";
+
+        // 添加警告信息
+        echo "<div style='background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 4px; padding: 10px; margin-top: 8px;'>";
+        echo "<strong>⚠️ 重要提醒：</strong><br>";
+        echo "• 关闭此选项后，本地文件将被永久删除<br>";
+        echo "• 请确保云盘服务稳定可靠<br>";
+        echo "• 建议先在测试环境中验证<br>";
+        echo "• 删除的文件包括图片的所有尺寸版本";
+        echo "</div>";
     }
     
     public function aid_field_callback() {

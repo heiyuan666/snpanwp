@@ -29,6 +29,7 @@ class ZeroNine_CDN_Cloud_Upload {
         add_action('wp_ajax_dmy_upload_to_cloud', array($this, 'ajax_upload_to_cloud'));
         add_action('wp_ajax_dmy_test_cloud_connection', array($this, 'ajax_test_cloud_connection'));
         add_action('wp_ajax_dmy_verify_attachment_url', array($this, 'ajax_verify_attachment_url'));
+        add_action('wp_ajax_dmy_delete_local_files', array($this, 'ajax_delete_local_files'));
         add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_scripts'));
         add_filter('manage_media_columns', array($this, 'add_media_column'));
         add_action('manage_media_custom_column', array($this, 'display_media_column'), 10, 2);
@@ -38,15 +39,12 @@ class ZeroNine_CDN_Cloud_Upload {
             return;
         }
 
-        // 启用自动上传功能 - 使用更安全的实现方式
-        // 在附件创建后立即处理，不干扰WordPress上传流程
+        // 启用自动上传功能 - 避免重复上传
+        // 只使用一个钩子来处理文件上传，防止重复
         add_action('add_attachment', array($this, 'handle_new_attachment'), 10, 1);
 
-        // 也可以通过设置控制是否启用自动上传
-        if (!empty($this->settings['dmy_cloud_auto_replace'])) {
-            // 如果用户明确启用了自动替换，使用更积极的方式
-            add_filter('wp_handle_upload', array($this, 'handle_upload_filter'), 999, 2);
-        }
+        // 添加标记来防止重复处理
+        $this->processed_attachments = array();
 
         // 替换内容中的媒体URL为云盘URL
         add_filter('wp_get_attachment_url', array($this, 'replace_attachment_url'), 10, 2);
@@ -72,6 +70,10 @@ class ZeroNine_CDN_Cloud_Upload {
 
         // 添加管理员脚本来处理媒体库 (暂时禁用以修复媒体库加载问题)
         // add_action('admin_enqueue_scripts', array($this, 'enqueue_media_scripts'));
+
+        // 添加对更多文件类型的支持
+        add_filter('upload_mimes', array($this, 'add_custom_upload_mimes'));
+        add_filter('wp_check_filetype_and_ext', array($this, 'check_filetype_and_ext'), 10, 4);
 
         // 添加异步上传处理
         add_action('dmy_cloud_upload_single', array($this, 'async_upload_single'), 10, 1);
@@ -99,10 +101,26 @@ class ZeroNine_CDN_Cloud_Upload {
      */
     public function handle_new_attachment($attachment_id) {
         try {
+            // 检查是否已经处理过这个附件，防止重复上传
+            if (isset($this->processed_attachments[$attachment_id])) {
+                error_log('DMY Cloud: Attachment ' . $attachment_id . ' already processed, skipping');
+                return;
+            }
+
+            // 标记为已处理
+            $this->processed_attachments[$attachment_id] = true;
+
             // 获取附件文件路径
             $file_path = get_attached_file($attachment_id);
             if (!$file_path || !file_exists($file_path)) {
                 error_log('DMY Cloud: File not found for attachment ' . $attachment_id);
+                return;
+            }
+
+            // 检查是否已经上传过到云盘
+            $existing_cloud_url = get_post_meta($attachment_id, '_dmy_cloud_url', true);
+            if (!empty($existing_cloud_url)) {
+                error_log('DMY Cloud: Attachment ' . $attachment_id . ' already has cloud URL: ' . $existing_cloud_url);
                 return;
             }
 
@@ -112,6 +130,9 @@ class ZeroNine_CDN_Cloud_Upload {
                 error_log('DMY Cloud: Skipping unsupported file type: ' . $file_type['type']);
                 return;
             }
+
+            // 记录文件类型信息
+            error_log('DMY Cloud: Processing file type: ' . $file_type['type'] . ' (' . $file_type['ext'] . ') for attachment ' . $attachment_id);
 
             // 立即上传到云盘（同步方式，但添加超时保护）
             $this->upload_attachment_to_cloud($attachment_id);
@@ -125,16 +146,36 @@ class ZeroNine_CDN_Cloud_Upload {
      * 上传附件到云盘的核心方法
      */
     public function upload_attachment_to_cloud($attachment_id) {
+        // 检查是否已经上传过
+        $existing_cloud_url = get_post_meta($attachment_id, '_dmy_cloud_url', true);
+        if (!empty($existing_cloud_url)) {
+            error_log('DMY Cloud: Attachment ' . $attachment_id . ' already uploaded to: ' . $existing_cloud_url);
+            return $existing_cloud_url;
+        }
+
         $file_path = get_attached_file($attachment_id);
         if (!$file_path || !file_exists($file_path)) {
+            error_log('DMY Cloud: File not found for attachment ' . $attachment_id . ': ' . $file_path);
             return false;
         }
+
+        // 检查文件是否正在上传中（防止并发上传）
+        $upload_lock = get_post_meta($attachment_id, '_dmy_cloud_uploading', true);
+        if ($upload_lock && (time() - $upload_lock) < 300) { // 5分钟锁定时间
+            error_log('DMY Cloud: Attachment ' . $attachment_id . ' is currently being uploaded, skipping');
+            return false;
+        }
+
+        // 设置上传锁定
+        update_post_meta($attachment_id, '_dmy_cloud_uploading', time());
 
         // 设置最大执行时间
         $original_time_limit = ini_get('max_execution_time');
         set_time_limit(120); // 2分钟超时
 
         try {
+            error_log('DMY Cloud: Starting upload for attachment ' . $attachment_id . ' (' . basename($file_path) . ')');
+
             // 上传到云盘
             $cloud_url = $this->upload_file_to_cloud($file_path);
 
@@ -144,61 +185,72 @@ class ZeroNine_CDN_Cloud_Upload {
                 update_post_meta($attachment_id, '_dmy_cloud_uploaded', true);
                 update_post_meta($attachment_id, '_dmy_cloud_upload_time', current_time('mysql'));
 
+                // 清除上传锁定
+                delete_post_meta($attachment_id, '_dmy_cloud_uploading');
+
                 error_log('DMY Cloud: Successfully uploaded attachment ' . $attachment_id . ' to ' . $cloud_url);
 
-                // 如果设置不保留本地文件，可以删除（但建议保留）
-                if (empty($this->settings['dmy_link_cloud_keep_local'])) {
-                    // 暂时不删除本地文件，确保稳定性
-                    // @unlink($file_path);
+                // 如果设置不保留本地文件，删除本地文件
+                if (empty($this->settings['dmy_cloud_keep_local'])) {
+                    $this->delete_local_file_safely($attachment_id, $file_path);
                 }
 
                 return $cloud_url;
             } else {
                 error_log('DMY Cloud: Failed to upload attachment ' . $attachment_id);
+                // 清除上传锁定
+                delete_post_meta($attachment_id, '_dmy_cloud_uploading');
                 return false;
             }
 
         } catch (Exception $e) {
             error_log('DMY Cloud Upload Exception: ' . $e->getMessage());
+            // 清除上传锁定
+            delete_post_meta($attachment_id, '_dmy_cloud_uploading');
             return false;
         } finally {
             // 恢复原始执行时间限制
             set_time_limit($original_time_limit);
+            // 确保清除上传锁定
+            delete_post_meta($attachment_id, '_dmy_cloud_uploading');
         }
     }
 
     /**
-     * 处理文件上传过滤器（更积极的替换方式）
+     * 处理文件上传过滤器（已禁用，避免重复上传）
+     *
+     * 注意：此函数已被禁用，因为它会导致重复上传同一个文件到云盘。
+     * 现在只使用 add_attachment 钩子来处理文件上传。
      */
     public function handle_upload_filter($upload, $context) {
-        // 检查上传是否成功
+        // 此函数已禁用，避免重复上传
+        error_log('DMY Cloud: handle_upload_filter called but disabled to prevent duplicate uploads');
+        return $upload;
+
+        /*
+        // 原始代码已注释，避免重复上传
         if (isset($upload['error'])) {
             return $upload;
         }
 
-        // 只处理图片文件
         $file_type = wp_check_filetype($upload['file']);
-        if (!in_array($file_type['type'], array('image/jpeg', 'image/png', 'image/gif', 'image/webp'))) {
+        if (!$this->is_supported_file_type($file_type['type'], $upload['file'])) {
             return $upload;
         }
 
         try {
-            // 立即上传到云盘
             $cloud_url = $this->upload_file_to_cloud($upload['file']);
-
             if ($cloud_url) {
-                // 直接替换URL
                 $upload['url'] = $cloud_url;
-                $upload['cloud_url'] = $cloud_url; // 保存云盘URL供后续使用
-
+                $upload['cloud_url'] = $cloud_url;
                 error_log('DMY Cloud: Replaced upload URL with cloud URL: ' . $cloud_url);
             }
-
         } catch (Exception $e) {
             error_log('DMY Cloud Upload Filter Error: ' . $e->getMessage());
         }
 
         return $upload;
+        */
     }
 
     /**
@@ -235,7 +287,7 @@ class ZeroNine_CDN_Cloud_Upload {
 
                 // 如果不保留本地文件，删除本地文件
                 if (empty($this->settings['dmy_cloud_keep_local'])) {
-                    @unlink($file_path);
+                    $this->delete_local_file_safely($attachment_id, $file_path);
                 }
 
                 error_log('DMY Cloud: Successfully uploaded attachment ' . $attachment_id . ' to ' . $cloud_url);
@@ -275,9 +327,9 @@ class ZeroNine_CDN_Cloud_Upload {
         }
         
         $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body, true);
-        
-        if ($data && $data['code'] == 200) {
+        $data = $this->safe_json_decode($body);
+
+        if ($data && isset($data['code']) && $data['code'] == 200) {
             return $data['data'];
         }
         
@@ -306,9 +358,9 @@ class ZeroNine_CDN_Cloud_Upload {
         }
         
         $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body, true);
-        
-        if ($data && $data['code'] == 200) {
+        $data = $this->safe_json_decode($body);
+
+        if ($data && isset($data['code']) && $data['code'] == 200) {
             return $data['data'];
         }
         
@@ -371,63 +423,91 @@ class ZeroNine_CDN_Cloud_Upload {
      * 使用cURL上传文件
      */
     private function upload_with_curl($upload_url, $file_path) {
-        // 检查cURL文件类是否存在
-        if (!class_exists('CURLFile')) {
+        // 检查cURL扩展和文件类 (PHP7-PHP8兼容)
+        if (!function_exists('curl_init') || !class_exists('CURLFile')) {
             return $this->upload_with_wp_http($upload_url, $file_path);
         }
 
         $ch = curl_init();
-
-        // 获取文件MIME类型
-        $mime_type = 'application/octet-stream';
-        if (function_exists('mime_content_type')) {
-            $mime_type = mime_content_type($file_path);
-        } elseif (function_exists('finfo_file')) {
-            $finfo = finfo_open(FILEINFO_MIME_TYPE);
-            $mime_type = finfo_file($finfo, $file_path);
-            finfo_close($finfo);
+        if ($ch === false) {
+            error_log('DMY Cloud: Failed to initialize cURL');
+            return $this->upload_with_wp_http($upload_url, $file_path);
         }
 
-        curl_setopt_array($ch, array(
-            CURLOPT_URL => $upload_url,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => array(
-                'file' => new CURLFile($file_path, $mime_type, basename($file_path))
-            ),
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 120, // 减少超时时间
-            CURLOPT_CONNECTTIMEOUT => 30,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => false,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 3,
-            CURLOPT_USERAGENT => 'DMY-Link-Plugin/1.3.6'
-        ));
+        try {
+            // 获取文件MIME类型 (PHP8兼容)
+            $mime_type = 'application/octet-stream';
 
-        $response = curl_exec($ch);
-        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
-        curl_close($ch);
+            if (function_exists('mime_content_type') && is_readable($file_path)) {
+                $detected_mime = mime_content_type($file_path);
+                if ($detected_mime !== false) {
+                    $mime_type = $detected_mime;
+                }
+            } elseif (function_exists('finfo_open') && function_exists('finfo_file')) {
+                $finfo = finfo_open(FILEINFO_MIME_TYPE);
+                if ($finfo !== false) {
+                    $detected_mime = finfo_file($finfo, $file_path);
+                    if ($detected_mime !== false) {
+                        $mime_type = $detected_mime;
+                    }
+                    finfo_close($finfo);
+                }
+            }
 
-        if ($error) {
-            error_log('DMY Cloud cURL Error: ' . $error);
-            return false;
-        }
+            // 创建CURLFile对象 (PHP8兼容)
+            $curl_file = new CURLFile($file_path, $mime_type, basename($file_path));
 
-        error_log('DMY Cloud: HTTP Code: ' . $http_code);
-        error_log('DMY Cloud: Response: ' . substr($response, 0, 500)); // 只记录前500字符
+            $curl_options = array(
+                CURLOPT_URL => $upload_url,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => array('file' => $curl_file),
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 120,
+                CURLOPT_CONNECTTIMEOUT => 30,
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_SSL_VERIFYHOST => false,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_MAXREDIRS => 3,
+                CURLOPT_USERAGENT => 'DMY-Cloud-Upload/1.1.0'
+            );
 
-        if ($http_code == 200) {
-            $data = json_decode($response, true);
-            if ($data && isset($data['code']) && $data['code'] == 200) {
-                error_log('DMY Cloud: Upload successful: ' . $data['data']);
-                return $data['data'];
+            // PHP8: 使用更安全的curl_setopt_array
+            if (!curl_setopt_array($ch, $curl_options)) {
+                throw new Exception('Failed to set cURL options');
+            }
+
+            $response = curl_exec($ch);
+            $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
+
+            if ($response === false || !empty($error)) {
+                throw new Exception('cURL execution failed: ' . $error);
+            }
+
+            error_log('DMY Cloud: HTTP Code: ' . $http_code);
+            error_log('DMY Cloud: Response: ' . substr($response, 0, 500));
+
+            if ($http_code == 200) {
+                $data = $this->safe_json_decode($response);
+                if ($data && isset($data['code']) && $data['code'] == 200) {
+                    error_log('DMY Cloud: Upload successful: ' . $data['data']);
+                    return $data['data'];
+                } else {
+                    $error_msg = isset($data['msg']) ? $data['msg'] : 'Unknown error';
+                    throw new Exception('API Error: ' . $error_msg);
+                }
             } else {
-                error_log('DMY Cloud: API Error: ' . ($data['msg'] ?? 'Unknown error'));
+                throw new Exception('HTTP error code: ' . $http_code);
+            }
+
+        } catch (Exception $e) {
+            error_log('DMY Cloud: cURL upload error: ' . $e->getMessage());
+            return false;
+        } finally {
+            if (is_resource($ch)) {
+                curl_close($ch);
             }
         }
-
-        return false;
     }
 
     /**
@@ -475,8 +555,8 @@ class ZeroNine_CDN_Cloud_Upload {
         error_log('DMY Cloud: Response: ' . $response_body);
 
         if ($http_code == 200) {
-            $data = json_decode($response_body, true);
-            if ($data && $data['code'] == 200) {
+            $data = $this->safe_json_decode($response_body);
+            if ($data && isset($data['code']) && $data['code'] == 200) {
                 return $data['data'];
             }
         }
@@ -524,6 +604,19 @@ class ZeroNine_CDN_Cloud_Upload {
         foreach ($attachments as $attachment) {
             $file_path = get_attached_file($attachment->ID);
             if ($file_path && file_exists($file_path)) {
+                // 检查是否已经上传过（防止重复上传）
+                $existing_cloud_url = get_post_meta($attachment->ID, '_dmy_cloud_url', true);
+                if (!empty($existing_cloud_url)) {
+                    $results[] = array(
+                        'id' => $attachment->ID,
+                        'title' => $attachment->post_title,
+                        'status' => 'skipped',
+                        'message' => '已上传到云盘: ' . $existing_cloud_url,
+                        'cloud_url' => $existing_cloud_url
+                    );
+                    continue;
+                }
+
                 // 检查文件类型是否支持
                 $file_type = wp_check_filetype($file_path);
                 if (!$this->is_supported_file_type($file_type['type'], $file_path)) {
@@ -536,25 +629,32 @@ class ZeroNine_CDN_Cloud_Upload {
                     continue;
                 }
 
-                $cloud_url = $this->upload_file_to_cloud($file_path);
+                // 使用统一的上传函数，包含重复检查和锁定机制
+                $cloud_url = $this->upload_attachment_to_cloud($attachment->ID);
                 if ($cloud_url) {
-                    // 更新附件URL
-                    update_post_meta($attachment->ID, '_dmy_cloud_url', $cloud_url);
-                    update_post_meta($attachment->ID, '_dmy_cloud_uploaded', true);
-
-                    $results[] = array(
+                    $result = array(
                         'id' => $attachment->ID,
                         'title' => $attachment->post_title,
                         'cloud_url' => $cloud_url,
                         'status' => 'success',
                         'file_type' => $file_type['type']
                     );
+
+                    // 检查是否删除了本地文件
+                    $local_deleted = get_post_meta($attachment->ID, '_dmy_cloud_local_deleted', true);
+                    if ($local_deleted) {
+                        $result['local_deleted'] = true;
+                        $result['message'] = '上传成功，本地文件已删除';
+                    }
+
+                    $results[] = $result;
                 } else {
                     $results[] = array(
                         'id' => $attachment->ID,
                         'title' => $attachment->post_title,
                         'status' => 'failed',
-                        'file_type' => $file_type['type']
+                        'file_type' => $file_type['type'],
+                        'message' => '上传失败，请查看错误日志'
                     );
                 }
             }
@@ -567,7 +667,85 @@ class ZeroNine_CDN_Cloud_Upload {
             'processed' => ($page - 1) * $per_page + count($attachments)
         ));
     }
-    
+
+    /**
+     * AJAX删除本地文件
+     */
+    public function ajax_delete_local_files() {
+        // 验证nonce
+        if (!wp_verify_nonce($_POST['nonce'], 'dmy_cloud_nonce')) {
+            wp_die('Security check failed');
+        }
+
+        // 检查权限
+        if (!current_user_can('manage_options')) {
+            wp_die('Insufficient permissions');
+        }
+
+        $page = isset($_POST['page']) ? intval($_POST['page']) : 1;
+        $per_page = 10; // 每次处理10个文件
+
+        // 获取已上传到云盘但本地文件未删除的附件
+        $attachments = get_posts(array(
+            'post_type' => 'attachment',
+            'post_status' => 'inherit',
+            'posts_per_page' => $per_page,
+            'paged' => $page,
+            'meta_query' => array(
+                'relation' => 'AND',
+                array(
+                    'key' => '_dmy_cloud_uploaded',
+                    'value' => true,
+                    'compare' => '='
+                ),
+                array(
+                    'key' => '_dmy_cloud_local_deleted',
+                    'compare' => 'NOT EXISTS'
+                )
+            )
+        ));
+
+        $results = array();
+
+        foreach ($attachments as $attachment) {
+            $file_path = get_attached_file($attachment->ID);
+            $cloud_url = get_post_meta($attachment->ID, '_dmy_cloud_url', true);
+
+            if ($file_path && file_exists($file_path) && !empty($cloud_url)) {
+                // 删除本地文件
+                if ($this->delete_local_file_safely($attachment->ID, $file_path)) {
+                    $results[] = array(
+                        'id' => $attachment->ID,
+                        'title' => $attachment->post_title,
+                        'status' => 'success',
+                        'message' => '本地文件已删除',
+                        'cloud_url' => $cloud_url
+                    );
+                } else {
+                    $results[] = array(
+                        'id' => $attachment->ID,
+                        'title' => $attachment->post_title,
+                        'status' => 'failed',
+                        'message' => '删除本地文件失败'
+                    );
+                }
+            } else {
+                $results[] = array(
+                    'id' => $attachment->ID,
+                    'title' => $attachment->post_title,
+                    'status' => 'skipped',
+                    'message' => '文件不存在或未上传到云盘'
+                );
+            }
+        }
+
+        wp_send_json_success(array(
+            'results' => $results,
+            'has_more' => count($attachments) == $per_page,
+            'processed' => ($page - 1) * $per_page + count($attachments)
+        ));
+    }
+
     /**
      * AJAX单个文件上传
      */
@@ -1057,9 +1235,9 @@ class ZeroNine_CDN_Cloud_Upload {
         }
 
         $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body, true);
+        $data = $this->safe_json_decode($body);
 
-        if ($data && $data['code'] == 200) {
+        if ($data && isset($data['code']) && $data['code'] == 200) {
             return $data['data'];
         }
 
@@ -1143,6 +1321,135 @@ class ZeroNine_CDN_Cloud_Upload {
         error_log('DMY Cloud: Verifying URL ' . $url . ' for attachment ' . $attachment_id . ': ' . ($matches ? 'MATCH' : 'NO MATCH'));
 
         return $matches;
+    }
+
+    /**
+     * 添加自定义文件类型到WordPress允许上传列表
+     */
+    public function add_custom_upload_mimes($mimes) {
+        // 添加常用但WordPress默认不支持的文件类型
+        $custom_mimes = array(
+            // Android应用
+            'apk' => 'application/vnd.android.package-archive',
+
+            // iOS应用
+            'ipa' => 'application/octet-stream',
+
+            // 压缩文件
+            'rar' => 'application/x-rar-compressed',
+            '7z' => 'application/x-7z-compressed',
+            'xz' => 'application/x-xz',
+
+            // 可执行文件
+            'exe' => 'application/x-msdownload',
+            'msi' => 'application/x-msdownload',
+            'dmg' => 'application/x-apple-diskimage',
+            'deb' => 'application/x-debian-package',
+            'rpm' => 'application/x-rpm',
+
+            // 音频文件
+            'flac' => 'audio/flac',
+            'ogg' => 'audio/ogg',
+            'opus' => 'audio/opus',
+
+            // 视频文件
+            'mkv' => 'video/x-matroska',
+            'webm' => 'video/webm',
+            'ogv' => 'video/ogg',
+
+            // 字体文件
+            'ttf' => 'font/ttf',
+            'otf' => 'font/otf',
+            'woff' => 'font/woff',
+            'woff2' => 'font/woff2',
+            'eot' => 'application/vnd.ms-fontobject',
+
+            // 其他文件
+            'iso' => 'application/x-iso9660-image',
+            'torrent' => 'application/x-bittorrent',
+            'epub' => 'application/epub+zip',
+            'mobi' => 'application/x-mobipocket-ebook',
+            'azw3' => 'application/x-mobipocket-ebook',
+
+            // 配置文件
+            'conf' => 'text/plain',
+            'cfg' => 'text/plain',
+            'ini' => 'text/plain',
+            'yaml' => 'text/plain',
+            'yml' => 'text/plain',
+            'toml' => 'text/plain',
+            'log' => 'text/plain'
+        );
+
+        // 合并到现有的MIME类型列表
+        return array_merge($mimes, $custom_mimes);
+    }
+
+    /**
+     * 增强文件类型检查
+     */
+    public function check_filetype_and_ext($data, $file, $filename, $mimes) {
+        $wp_filetype = wp_check_filetype($filename, $mimes);
+        $ext = $wp_filetype['ext'];
+        $type = $wp_filetype['type'];
+
+        // 如果WordPress无法识别文件类型，尝试我们的自定义检测
+        if (!$type || !$ext) {
+            $file_ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+
+            // 特殊处理一些文件类型
+            switch ($file_ext) {
+                case 'apk':
+                    $type = 'application/vnd.android.package-archive';
+                    $ext = 'apk';
+                    break;
+                case 'ipa':
+                    $type = 'application/octet-stream';
+                    $ext = 'ipa';
+                    break;
+                case 'exe':
+                case 'msi':
+                    $type = 'application/x-msdownload';
+                    $ext = $file_ext;
+                    break;
+                case 'dmg':
+                    $type = 'application/x-apple-diskimage';
+                    $ext = 'dmg';
+                    break;
+                case 'deb':
+                    $type = 'application/x-debian-package';
+                    $ext = 'deb';
+                    break;
+                case 'rpm':
+                    $type = 'application/x-rpm';
+                    $ext = 'rpm';
+                    break;
+                case 'rar':
+                    $type = 'application/x-rar-compressed';
+                    $ext = 'rar';
+                    break;
+                case '7z':
+                    $type = 'application/x-7z-compressed';
+                    $ext = '7z';
+                    break;
+                case 'iso':
+                    $type = 'application/x-iso9660-image';
+                    $ext = 'iso';
+                    break;
+                case 'torrent':
+                    $type = 'application/x-bittorrent';
+                    $ext = 'torrent';
+                    break;
+            }
+
+            if ($type && $ext) {
+                $data['ext'] = $ext;
+                $data['type'] = $type;
+                $data['proper_filename'] = $filename;
+            }
+        }
+
+        return $data;
     }
 
     /**
@@ -1252,6 +1559,208 @@ class ZeroNine_CDN_Cloud_Upload {
         $image_extensions = array('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tiff', 'tif', 'svg', 'ico');
         $file_extension = strtolower(pathinfo($file_path, PATHINFO_EXTENSION));
         return in_array($file_extension, $image_extensions);
+    }
+
+    /**
+     * 安全的JSON解码 (PHP7-PHP8兼容)
+     */
+    private function safe_json_decode($json, $assoc = true) {
+        if (empty($json)) {
+            return null;
+        }
+
+        try {
+            // PHP8: 使用JSON_THROW_ON_ERROR标志
+            if (defined('JSON_THROW_ON_ERROR')) {
+                return json_decode($json, $assoc, 512, JSON_THROW_ON_ERROR);
+            } else {
+                // PHP7: 传统方式
+                $result = json_decode($json, $assoc);
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    error_log('DMY Cloud: JSON decode error: ' . json_last_error_msg());
+                    return null;
+                }
+                return $result;
+            }
+        } catch (JsonException $e) {
+            error_log('DMY Cloud: JSON decode exception: ' . $e->getMessage());
+            return null;
+        } catch (Exception $e) {
+            error_log('DMY Cloud: JSON decode error: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 清理重复上传的文件（管理工具）
+     */
+    public function cleanup_duplicate_uploads() {
+        global $wpdb;
+
+        // 查找可能重复的云盘URL
+        $duplicates = $wpdb->get_results("
+            SELECT meta_value, COUNT(*) as count
+            FROM {$wpdb->postmeta}
+            WHERE meta_key = '_dmy_cloud_url'
+            GROUP BY meta_value
+            HAVING count > 1
+        ");
+
+        $cleaned = 0;
+        foreach ($duplicates as $duplicate) {
+            error_log('DMY Cloud: Found duplicate cloud URL: ' . $duplicate->meta_value . ' (used ' . $duplicate->count . ' times)');
+
+            // 获取使用此URL的所有附件
+            $attachments = $wpdb->get_results($wpdb->prepare("
+                SELECT post_id
+                FROM {$wpdb->postmeta}
+                WHERE meta_key = '_dmy_cloud_url'
+                AND meta_value = %s
+            ", $duplicate->meta_value));
+
+            // 保留第一个，删除其他的云盘URL记录
+            $first = true;
+            foreach ($attachments as $attachment) {
+                if ($first) {
+                    $first = false;
+                    continue;
+                }
+
+                // 删除重复的云盘URL记录
+                delete_post_meta($attachment->post_id, '_dmy_cloud_url');
+                delete_post_meta($attachment->post_id, '_dmy_cloud_uploaded');
+                $cleaned++;
+
+                error_log('DMY Cloud: Cleaned duplicate upload record for attachment ' . $attachment->post_id);
+            }
+        }
+
+        return $cleaned;
+    }
+
+    /**
+     * 检查并修复上传锁定（清理过期的锁定）
+     */
+    public function cleanup_upload_locks() {
+        global $wpdb;
+
+        // 清理超过1小时的上传锁定
+        $expired_locks = $wpdb->get_results($wpdb->prepare("
+            SELECT post_id, meta_value
+            FROM {$wpdb->postmeta}
+            WHERE meta_key = '_dmy_cloud_uploading'
+            AND meta_value < %d
+        ", time() - 3600));
+
+        $cleaned = 0;
+        foreach ($expired_locks as $lock) {
+            delete_post_meta($lock->post_id, '_dmy_cloud_uploading');
+            $cleaned++;
+            error_log('DMY Cloud: Cleaned expired upload lock for attachment ' . $lock->post_id);
+        }
+
+        return $cleaned;
+    }
+
+    /**
+     * 安全删除本地文件
+     */
+    private function delete_local_file_safely($attachment_id, $file_path) {
+        // 再次确认设置
+        if (!empty($this->settings['dmy_cloud_keep_local'])) {
+            error_log('DMY Cloud: Keep local file setting is enabled, not deleting file for attachment ' . $attachment_id);
+            return false;
+        }
+
+        // 确认文件存在
+        if (!file_exists($file_path)) {
+            error_log('DMY Cloud: File does not exist, cannot delete: ' . $file_path);
+            return false;
+        }
+
+        // 确认云盘URL存在
+        $cloud_url = get_post_meta($attachment_id, '_dmy_cloud_url', true);
+        if (empty($cloud_url)) {
+            error_log('DMY Cloud: No cloud URL found, not deleting local file for attachment ' . $attachment_id);
+            return false;
+        }
+
+        // 对于图片文件，需要删除所有尺寸的文件
+        if ($this->is_image_file($file_path)) {
+            $this->delete_image_files($attachment_id, $file_path);
+        } else {
+            // 删除单个文件
+            if (@unlink($file_path)) {
+                error_log('DMY Cloud: Successfully deleted local file: ' . $file_path);
+
+                // 更新附件记录，标记本地文件已删除
+                update_post_meta($attachment_id, '_dmy_cloud_local_deleted', true);
+                update_post_meta($attachment_id, '_dmy_cloud_local_delete_time', current_time('mysql'));
+
+                return true;
+            } else {
+                error_log('DMY Cloud: Failed to delete local file: ' . $file_path);
+                return false;
+            }
+        }
+    }
+
+    /**
+     * 删除图片的所有尺寸文件
+     */
+    private function delete_image_files($attachment_id, $main_file_path) {
+        $deleted_files = array();
+        $failed_files = array();
+
+        // 获取图片的所有尺寸
+        $metadata = wp_get_attachment_metadata($attachment_id);
+
+        // 删除主文件
+        if (@unlink($main_file_path)) {
+            $deleted_files[] = basename($main_file_path);
+            error_log('DMY Cloud: Deleted main image file: ' . $main_file_path);
+        } else {
+            $failed_files[] = basename($main_file_path);
+            error_log('DMY Cloud: Failed to delete main image file: ' . $main_file_path);
+        }
+
+        // 删除各种尺寸的文件
+        if (isset($metadata['sizes']) && is_array($metadata['sizes'])) {
+            $upload_dir = wp_upload_dir();
+            $base_dir = dirname($main_file_path);
+
+            foreach ($metadata['sizes'] as $size => $size_data) {
+                if (isset($size_data['file'])) {
+                    $size_file_path = $base_dir . '/' . $size_data['file'];
+
+                    if (file_exists($size_file_path)) {
+                        if (@unlink($size_file_path)) {
+                            $deleted_files[] = $size_data['file'] . ' (' . $size . ')';
+                            error_log('DMY Cloud: Deleted image size file: ' . $size_file_path);
+                        } else {
+                            $failed_files[] = $size_data['file'] . ' (' . $size . ')';
+                            error_log('DMY Cloud: Failed to delete image size file: ' . $size_file_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 记录删除结果
+        if (!empty($deleted_files)) {
+            update_post_meta($attachment_id, '_dmy_cloud_local_deleted', true);
+            update_post_meta($attachment_id, '_dmy_cloud_local_delete_time', current_time('mysql'));
+            update_post_meta($attachment_id, '_dmy_cloud_deleted_files', $deleted_files);
+
+            error_log('DMY Cloud: Successfully deleted ' . count($deleted_files) . ' files for attachment ' . $attachment_id);
+        }
+
+        if (!empty($failed_files)) {
+            update_post_meta($attachment_id, '_dmy_cloud_delete_failed_files', $failed_files);
+            error_log('DMY Cloud: Failed to delete ' . count($failed_files) . ' files for attachment ' . $attachment_id);
+        }
+
+        return count($failed_files) === 0;
     }
 }
 
